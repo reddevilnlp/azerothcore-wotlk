@@ -20,13 +20,17 @@
 #include "DBCStores.h"
 #include "DatabaseEnv.h"
 #include "GameTime.h"
+#include "Group.h"
 #include "InstanceSaveMgr.h"
 #include "InstanceScript.h"
 #include "Language.h"
 #include "MapMgr.h"
+#include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Player.h"
 #include "RBAC.h"
+
+#include <vector>
 
 using namespace Acore::ChatCommands;
 
@@ -41,6 +45,7 @@ public:
         {
             { "listbinds",    HandleInstanceListBindsCommand,    rbac::RBAC_PERM_COMMAND_INSTANCE_LISTBINDS,     Console::No },
             { "unbind",       HandleInstanceUnbindCommand,       rbac::RBAC_PERM_COMMAND_INSTANCE_UNBIND,        Console::Yes },
+            { "unbindgroup",  HandleInstanceUnbindGroupCommand,  rbac::RBAC_PERM_COMMAND_INSTANCE_UNBIND,        Console::No },
             { "stats",        HandleInstanceStatsCommand,        rbac::RBAC_PERM_COMMAND_INSTANCE_STATS,         Console::Yes },
             { "savedata",     HandleInstanceSaveDataCommand,     rbac::RBAC_PERM_COMMAND_INSTANCE_SAVEDATA,      Console::No },
             { "setbossstate", HandleInstanceSetBossStateCommand, rbac::RBAC_PERM_COMMAND_INSTANCE_SET_BOSS_STATE, Console::Yes },
@@ -111,7 +116,6 @@ public:
                 currentMapId = (*result)[0].Get<uint16>();
         }
 
-        uint16 counter = 0;
         uint16 mapId = 0;
 
         if (mapArg.holds_alternative<uint16>())
@@ -121,6 +125,69 @@ public:
                 return false;
         }
 
+        uint32 const count = UnbindInstances(guid, player, currentMapId, mapId, difficultyArg, handler);
+        handler->PSendSysMessage("instances unbound: {}", count);
+        return true;
+    }
+
+    static bool HandleInstanceUnbindGroupCommand(ChatHandler* handler, uint16 mapId, uint32 difficulty)
+    {
+        Player* leader = handler->GetSession()->GetPlayer();
+        if (!leader->CanBeGameMaster())
+        {
+            handler->SendErrorMessage("Only a game master can unbind a raid group.");
+            return false;
+        }
+
+        MapEntry const* map = sMapStore.LookupEntry(mapId);
+        if (!map || !map->IsRaid() || difficulty >= MAX_RAID_DIFFICULTY ||
+            !GetMapDifficultyData(mapId, Difficulty(difficulty)))
+        {
+            handler->SendErrorMessage("Choose a valid raid map and difficulty for instance unbindgroup.");
+            return false;
+        }
+
+        Group const* group = leader->GetGroup();
+        if (!group || !group->isRaidGroup() || !group->IsLeader(leader->GetGUID()))
+        {
+            handler->SendErrorMessage("Only the raid leader can unbind the group's instances.");
+            return false;
+        }
+
+        std::vector<Player*> members;
+        members.reserve(group->GetMemberSlots().size());
+        for (Group::MemberSlot const& slot : group->GetMemberSlots())
+        {
+            Player* member = ObjectAccessor::FindConnectedPlayer(slot.guid);
+            if (!member || !member->IsInWorld() || member->GetGroup() != group || member->IsBeingTeleported())
+            {
+                handler->SendErrorMessage("All raid members must be online and settled before unbinding ({}).",
+                    slot.name);
+                return false;
+            }
+            if (member->GetMapId() == mapId)
+            {
+                handler->SendErrorMessage("All raid members must leave map {} before unbinding ({}).", mapId, slot.name);
+                return false;
+            }
+            if (handler->HasLowerSecurity(member))
+                return false;
+
+            members.push_back(member);
+        }
+
+        uint32 count = 0;
+        for (Player* member : members)
+            count += UnbindInstances(member->GetGUID(), member, member->GetMapId(), mapId, difficulty);
+
+        handler->PSendSysMessage("group instances unbound: {} across {} members", count, members.size());
+        return true;
+    }
+
+    static uint32 UnbindInstances(ObjectGuid guid, Player* player, uint32 currentMapId, uint16 mapId,
+        Optional<uint32> difficulty, ChatHandler* details = nullptr)
+    {
+        uint32 count = 0;
         for (uint8 i = 0; i < MAX_DIFFICULTY; ++i)
         {
             BoundInstancesMap const& m_boundInstances = sInstanceSaveMgr->PlayerGetBoundInstances(guid, Difficulty(i));
@@ -128,24 +195,27 @@ public:
             {
                 InstanceSave const* save = itr->second.save;
                 if (itr->first != currentMapId && (!mapId || mapId == itr->first)
-                    && (!difficultyArg || *difficultyArg == uint32(save->GetDifficulty())))
+                    && (!difficulty || *difficulty == uint32(save->GetDifficulty())))
                 {
-                    uint32 resetTime = itr->second.extended ? save->GetExtendedResetTime() : save->GetResetTime();
-                    uint32 ttr = (resetTime >= GameTime::GetGameTime().count() ? resetTime - GameTime::GetGameTime().count() : 0);
-                    std::string timeleft = secsToTimeString(ttr);
-                    handler->PSendSysMessage("unbinding map: {}, inst: {}, perm: {}, diff: {}, canReset: {}, TTR: {}{}", itr->first, save->GetInstanceId(), itr->second.perm ? "yes" : "no", save->GetDifficulty(), save->CanReset() ? "yes" : "no", timeleft, (itr->second.extended ? " (extended)" : ""));
+                    if (details)
+                    {
+                        uint32 const resetTime = itr->second.extended ? save->GetExtendedResetTime() : save->GetResetTime();
+                        uint32 const now = GameTime::GetGameTime().count();
+                        std::string const timeleft = secsToTimeString(resetTime >= now ? resetTime - now : 0);
+                        details->PSendSysMessage("unbinding map: {}, inst: {}, perm: {}, diff: {}, canReset: {}, TTR: {}{}",
+                            itr->first, save->GetInstanceId(), itr->second.perm ? "yes" : "no", save->GetDifficulty(),
+                            save->CanReset() ? "yes" : "no", itr->second.extended ? " (extended)" : "");
+                    }
                     sInstanceSaveMgr->PlayerUnbindInstance(guid, itr->first, Difficulty(i), true, player);
                     itr = m_boundInstances.begin();
-                    counter++;
+                    ++count;
                 }
                 else
                     ++itr;
             }
         }
 
-        handler->PSendSysMessage("instances unbound: {}", counter);
-
-        return true;
+        return count;
     }
 
     static bool HandleInstanceStatsCommand(ChatHandler* handler)
