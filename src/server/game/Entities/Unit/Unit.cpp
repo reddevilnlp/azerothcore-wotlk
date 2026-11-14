@@ -8216,6 +8216,25 @@ float Unit::SpellPctDamageModsDone(Unit* victim, SpellInfo const* spellProto, Da
             return false;
     }
 
+        // era-talents (mod-era-talents): a "Wand Specialization" passive is aura 79
+        // MOD_DAMAGE_PERCENT_DONE gated to ITEM_SUBCLASS_WEAPON_WAND. Its damage school is
+        // multi-school because a wand SHOT takes the equipped wand's magic school, so unlike stock
+        // 2H-spec (misc 1 = NORMAL) it slips past the guard above and would boost every same-school
+        // SPELL the caster casts while a wand is equipped. Wand shots go through MeleeDamageBonusDone,
+        // never this function, so skipping the aura here for a non-weapon spell leaves the wand-shot
+        // bonus intact. Band-gated to the reserved era spell range [920000, 950000) so it is inert
+        // for every stock aura (retail teaches no wand talent in WotLK).
+        if (spellProto->EquippedItemClass == -1)
+        {
+            SpellInfo const* eraInfo = aurEff->GetSpellInfo();
+            if (eraInfo->Id >= 920000 && eraInfo->Id < 950000 &&
+                eraInfo->EquippedItemClass == ITEM_CLASS_WEAPON &&
+                (eraInfo->EquippedItemSubClassMask & (1 << ITEM_SUBCLASS_WEAPON_WAND)))
+            {
+                return false;
+            }
+        }
+
         if (!spellProto->ValidateAttribute6SpellDamageMods(this, aurEff, damagetype == DOT))
             return false;
 
@@ -8257,9 +8276,19 @@ float Unit::SpellPctDamageModsDone(Unit* victim, SpellInfo const* spellProto, Da
         {
             case 4920: // Molten Fury
             case 4919:
-                if (victim->HasAuraState(AURA_STATE_HEALTHLESS_35_PERCENT, spellProto, this))
+            {
+                // era-talents (mod-era-talents): TBC Molten Fury's window is 20%, WotLK's is 35%.
+                // Only auras in the reserved era band [920000, 950000) take the 20% state (the TBC
+                // node 20842 auto-passives 942736/942737); stock 31679/31680 keep 35%. The core
+                // already maintains AURA_STATE_HEALTHLESS_20_PERCENT for Execute / Hammer of Wrath.
+                // Kept out of core spell data so a fork reset can't lose it (patch 0026).
+                uint32 mfSpellId = (*i)->GetId();
+                AuraStateType mfState = (mfSpellId >= 920000 && mfSpellId < 950000)
+                    ? AURA_STATE_HEALTHLESS_20_PERCENT : AURA_STATE_HEALTHLESS_35_PERCENT;
+                if (victim->HasAuraState(mfState, spellProto, this))
                     AddPct(DoneTotalMod, (*i)->GetAmount());
                 break;
+            }
         }
 
         if (!(*i)->IsAffectedOnSpell(spellProto))
@@ -9015,6 +9044,27 @@ float Unit::SpellTakenCritChance(Unit const* caster, SpellInfo const* spellProto
                                 break;
                             default:
                                 break;
+                        }
+                    }
+                    // era-talents (mod-era-talents): crit chance vs FROZEN targets, i.e. a custom
+                    // "Shatter". No aura/SpellMod expresses conditional crit, so the talent passive
+                    // carries a SPELL_AURA_DUMMY marker: MiscValue 1 = the "crit vs frozen" opcode,
+                    // amount = the % bonus. Only passives in the reserved era spell band
+                    // [920000, 950000) are honoured, which makes the marker collision-proof against
+                    // stock dummy auras. Kept out of core spell data so a fork reset can't lose it.
+                    // The upper bound was WIDENED in TBC Phase 9 (2026-09-05) from the old
+                    // Vanilla-only window so the TBC Shatter node 20857's own auto-passives
+                    // 942856-942860 arm this hunk too; it is the same band patch 0025 uses.
+                    if (HasAuraState(AURA_STATE_FROZEN, spellProto, caster))
+                    {
+                        for (AuraEffect const* eraEff : caster->GetAuraEffectsByType(SPELL_AURA_DUMMY))
+                        {
+                            if (eraEff->GetMiscValue() != 1)
+                                continue;
+
+                            uint32 eraSpellId = eraEff->GetSpellInfo()->Id;
+                            if (eraSpellId >= 920000 && eraSpellId < 950000)
+                                crit_chance += eraEff->GetAmount();
                         }
                     }
                     // Custom crit by class
